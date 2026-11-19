@@ -30,8 +30,8 @@ int main(int argc, char **argv) {
     int agents = (argc > 3) ? atoi(argv[3]) : 256;
     int msgs_per_agent = (argc > 4) ? atoi(argv[4]) : 20;
 
-    if (agents <= 0 || agents > 8192 || msgs_per_agent <= 0) {
-        fprintf(stderr, "usage: %s [host] [port] [agents<=8192] [msgs_per_agent]\n", argv[0]);
+    if (agents <= 0 || agents > 16384 || msgs_per_agent <= 0) {
+        fprintf(stderr, "usage: %s [host] [port] [agents<=16384] [msgs_per_agent]\n", argv[0]);
         return 1;
     }
 
