@@ -126,17 +126,20 @@ int main(int argc, char **argv) {
     double t0 = now_sec();
     int connected = 0;
     int connect_errors = 0;
+    int refused_errors = 0;
 
     for (int i = 0; i < agents; i++) {
         if (i > 0 && (i % 256) == 0) {
             struct timespec pace = { .tv_sec = 0, .tv_nsec = 2000000L };
             nanosleep(&pace, NULL);
         }
+
+        const int max_attempts = 32;
         int ok = 0;
-        for (int attempt = 0; attempt < 8; attempt++) {
+        for (int attempt = 0; attempt < max_attempts; attempt++) {
             int s = socket(AF_INET, SOCK_STREAM, 0);
             if (s < 0) {
-                if (attempt == 7) {
+                if (attempt == max_attempts - 1) {
                     if (connect_errors < 5) {
                         fprintf(stderr, "conn_err[%d] at agent %d: %s (errno=%d)\n",
                                 connect_errors, i, strerror(errno), errno);
@@ -146,11 +149,12 @@ int main(int argc, char **argv) {
                 continue;
             }
             if (set_nonblocking(s) < 0) {
+                int saved_err = errno;
                 close(s);
-                if (attempt == 7) {
+                if (attempt == max_attempts - 1) {
                     if (connect_errors < 5) {
                         fprintf(stderr, "conn_err[%d] at agent %d: %s (errno=%d)\n",
-                                connect_errors, i, strerror(errno), errno);
+                                connect_errors, i, strerror(saved_err), saved_err);
                     }
                     connect_errors++;
                 }
@@ -161,10 +165,20 @@ int main(int argc, char **argv) {
                 if (errno != EINPROGRESS || wait_connect_complete(s, 5000) < 0) {
                     int saved_err = errno;
                     close(s);
-                    if (saved_err == ECONNREFUSED && attempt < 7) {
-                        struct timespec ts = { .tv_sec = 0, .tv_nsec = 2000000L * (attempt + 1) };
+                    if (saved_err == ECONNREFUSED && attempt + 1 < max_attempts) {
+                        long delay_ms = 5L * (attempt + 1);
+                        if (delay_ms > 50L) {
+                            delay_ms = 50L;
+                        }
+                        struct timespec ts = {
+                            .tv_sec = delay_ms / 1000L,
+                            .tv_nsec = (delay_ms % 1000L) * 1000000L
+                        };
                         nanosleep(&ts, NULL);
                         continue;
+                    }
+                    if (saved_err == ECONNREFUSED) {
+                        refused_errors++;
                     }
                     if (connect_errors < 5) {
                         fprintf(stderr, "conn_err[%d] at agent %d: %s (errno=%d)\n",
@@ -251,5 +265,8 @@ int main(int argc, char **argv) {
 
     free(fds);
     free(sent_msgs);
+    if (refused_errors > 0) {
+        fprintf(stderr, "refused_errors=%d\n", refused_errors);
+    }
     return 0;
 }
