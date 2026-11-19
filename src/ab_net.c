@@ -113,20 +113,42 @@ static void conn_reset(ab_server_t *srv, ab_conn_t *c) {
     c->want_write = 0;
     c->agent_id = 0;
     c->last_active = 0;
+    c->last_ping_sent = 0;
     c->recv_len = 0;
     c->send_len = 0;
     c->send_off = 0;
 }
 
-static void sweep_idle_conns(ab_server_t *srv, time_t now) {
-    if (!srv || srv->idle_timeout_sec <= 0) {
+static void send_heartbeat_ping(ab_server_t *srv, ab_conn_t *c, time_t now) {
+    uint8_t pkt[AB_HDR_SIZE];
+    size_t written = 0;
+    if (ab_frame_encode(pkt, sizeof(pkt), &written,
+                        AB_MSG_PING, 0u, c->agent_id, NULL, 0u) == AB_PARSE_OK) {
+        c->last_ping_sent = now;
+        ab_conn_send(srv, c, pkt, written);
+    }
+}
+
+void ab_server_sweep_timers(ab_server_t *srv, time_t now) {
+    if (!srv) {
         return;
     }
-    time_t limit = (time_t)srv->idle_timeout_sec;
+    time_t idle_limit = (srv->idle_timeout_sec > 0) ? (time_t)srv->idle_timeout_sec : 0;
+    time_t ping_interval = (srv->ping_interval_sec > 0) ? (time_t)srv->ping_interval_sec : 0;
+
     for (int i = 0; i < AB_MAX_CONNS; i++) {
         ab_conn_t *c = &srv->conns[i];
-        if (c->active && c->last_active > 0 && (now - c->last_active) > limit) {
+        if (!c->active) {
+            continue;
+        }
+        if (idle_limit > 0 && c->last_active > 0 && (now - c->last_active) > idle_limit) {
             conn_reset(srv, c);
+            continue;
+        }
+        if (ping_interval > 0 && c->last_active > 0 &&
+            (now - c->last_active) >= ping_interval &&
+            (c->last_ping_sent == 0 || (now - c->last_ping_sent) >= ping_interval)) {
+            send_heartbeat_ping(srv, c, now);
         }
     }
 }
@@ -170,6 +192,7 @@ static void handle_accept(ab_server_t *srv) {
         c->fd = cfd;
         c->active = 1;
         c->last_active = now;
+        c->last_ping_sent = now;
     }
 }
 
@@ -360,6 +383,7 @@ int ab_server_init(ab_server_t *srv, const char *host, uint16_t port,
     srv->listen_fd = -1;
     srv->epoll_fd = -1;
     srv->idle_timeout_sec = AB_IDLE_TIMEOUT_SEC;
+    srv->ping_interval_sec = AB_PING_INTERVAL_SEC;
     srv->on_frame = on_frame;
     srv->user_ctx = user_ctx;
 
@@ -430,7 +454,7 @@ int ab_server_run(ab_server_t *srv) {
         int nfds = epoll_wait(srv->epoll_fd, events, 256, 250);
         if (nfds < 0) {
             if (errno == EINTR) {
-                sweep_idle_conns(srv, time(NULL));
+                ab_server_sweep_timers(srv, time(NULL));
                 continue;
             }
             return -1;
@@ -456,7 +480,7 @@ int ab_server_run(ab_server_t *srv) {
             }
         }
 
-        sweep_idle_conns(srv, time(NULL));
+        ab_server_sweep_timers(srv, time(NULL));
     }
 
     return 0;

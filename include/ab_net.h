@@ -11,6 +11,7 @@
 #define AB_RECV_BUF_CAP 65536u
 #define AB_SEND_BUF_CAP 65536u
 #define AB_IDLE_TIMEOUT_SEC 60
+#define AB_PING_INTERVAL_SEC 15
 
 typedef struct {
     int fd;
@@ -18,6 +19,7 @@ typedef struct {
     int want_write;
     uint64_t agent_id;
     time_t last_active;
+    time_t last_ping_sent;
     uint8_t recv_buf[AB_RECV_BUF_CAP];
     size_t recv_len;
     uint8_t send_buf[AB_SEND_BUF_CAP];
@@ -38,6 +40,7 @@ typedef struct {
     int epoll_fd;
     int running;
     int idle_timeout_sec;
+    int ping_interval_sec;
     ab_conn_t conns[AB_MAX_CONNS];
     ab_hash_slot_t agent_map[AB_HASH_CAP];
     ab_on_frame_fn on_frame;
@@ -49,6 +52,7 @@ int ab_server_init(ab_server_t *srv, const char *host, uint16_t port,
 int ab_server_run(ab_server_t *srv);
 void ab_server_stop(ab_server_t *srv);
 void ab_server_close(ab_server_t *srv);
+void ab_server_sweep_timers(ab_server_t *srv, time_t now);
 int ab_conn_send(ab_server_t *srv, ab_conn_t *conn, const uint8_t *data, size_t len);
 ab_conn_t *ab_server_find_by_agent(ab_server_t *srv, uint64_t agent_id);
 
