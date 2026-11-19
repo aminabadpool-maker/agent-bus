@@ -11,6 +11,68 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+static uint32_t hash_u64(uint64_t x) {
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    x *= 0xc4ceb9fe1a85ec53ULL;
+    x ^= x >> 33;
+    return (uint32_t)(x & (AB_HASH_CAP - 1u));
+}
+
+static void map_clear_all(ab_server_t *srv) {
+    for (uint32_t i = 0; i < AB_HASH_CAP; i++) {
+        srv->agent_map[i].key = 0ull;
+        srv->agent_map[i].conn_idx = -1;
+    }
+}
+
+static int map_put(ab_server_t *srv, uint64_t agent_id, int32_t conn_idx) {
+    if (!srv || agent_id == 0ull || conn_idx < 0 || conn_idx >= AB_MAX_CONNS) {
+        return -1;
+    }
+    uint32_t idx = hash_u64(agent_id);
+    for (uint32_t step = 0; step < AB_HASH_CAP; step++) {
+        uint32_t slot = (idx + step) & (AB_HASH_CAP - 1u);
+        if (srv->agent_map[slot].key == 0ull || srv->agent_map[slot].key == agent_id) {
+            srv->agent_map[slot].key = agent_id;
+            srv->agent_map[slot].conn_idx = conn_idx;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static void map_remove_by_key_and_idx(ab_server_t *srv, uint64_t agent_id, int32_t conn_idx) {
+    if (!srv || agent_id == 0ull) {
+        return;
+    }
+    uint32_t idx = hash_u64(agent_id);
+    for (uint32_t step = 0; step < AB_HASH_CAP; step++) {
+        uint32_t slot = (idx + step) & (AB_HASH_CAP - 1u);
+        uint64_t k = srv->agent_map[slot].key;
+        if (k == 0ull) {
+            return;
+        }
+        if (k == agent_id && (conn_idx < 0 || srv->agent_map[slot].conn_idx == conn_idx)) {
+            srv->agent_map[slot].key = 0ull;
+            srv->agent_map[slot].conn_idx = -1;
+
+            /* Re-insert contiguous cluster entries so linear probing stays intact */
+            uint32_t next = (slot + 1u) & (AB_HASH_CAP - 1u);
+            while (srv->agent_map[next].key != 0ull) {
+                uint64_t rk = srv->agent_map[next].key;
+                int32_t ridx = srv->agent_map[next].conn_idx;
+                srv->agent_map[next].key = 0ull;
+                srv->agent_map[next].conn_idx = -1;
+                map_put(srv, rk, ridx);
+                next = (next + 1u) & (AB_HASH_CAP - 1u);
+            }
+            return;
+        }
+    }
+}
+
 static int set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags < 0) {
@@ -36,6 +98,10 @@ static int epoll_update_events(int epoll_fd, ab_conn_t *c) {
 static void conn_reset(ab_server_t *srv, ab_conn_t *c) {
     if (!c) {
         return;
+    }
+    int32_t idx = (int32_t)(c - srv->conns);
+    if (c->agent_id != 0ull && idx >= 0 && idx < AB_MAX_CONNS) {
+        map_remove_by_key_and_idx(srv, c->agent_id, idx);
     }
     if (c->fd >= 0) {
         if (srv && srv->epoll_fd >= 0) {
@@ -199,7 +265,12 @@ static void process_conn_buffer(ab_server_t *srv, ab_conn_t *c) {
         }
 
         if (hdr.type == AB_MSG_HELLO && hdr.agent_id != 0ull) {
+            int32_t idx = (int32_t)(c - srv->conns);
+            if (c->agent_id != 0ull && c->agent_id != hdr.agent_id) {
+                map_remove_by_key_and_idx(srv, c->agent_id, idx);
+            }
             c->agent_id = hdr.agent_id;
+            map_put(srv, c->agent_id, idx);
         }
 
         if (srv->on_frame) {
@@ -273,6 +344,7 @@ int ab_server_init(ab_server_t *srv, const char *host, uint16_t port,
         srv->conns[i].fd = -1;
         srv->conns[i].active = 0;
     }
+    map_clear_all(srv);
 
     int lfd = socket(AF_INET, SOCK_STREAM, 0);
     if (lfd < 0) {
@@ -376,6 +448,7 @@ void ab_server_close(ab_server_t *srv) {
             conn_reset(srv, &srv->conns[i]);
         }
     }
+    map_clear_all(srv);
     if (srv->epoll_fd >= 0) {
         close(srv->epoll_fd);
         srv->epoll_fd = -1;
@@ -390,9 +463,20 @@ ab_conn_t *ab_server_find_by_agent(ab_server_t *srv, uint64_t agent_id) {
     if (!srv || agent_id == 0ull) {
         return NULL;
     }
-    for (int i = 0; i < AB_MAX_CONNS; i++) {
-        if (srv->conns[i].active && srv->conns[i].agent_id == agent_id) {
-            return &srv->conns[i];
+    uint32_t idx = hash_u64(agent_id);
+    for (uint32_t step = 0; step < AB_HASH_CAP; step++) {
+        uint32_t slot = (idx + step) & (AB_HASH_CAP - 1u);
+        uint64_t k = srv->agent_map[slot].key;
+        if (k == 0ull) {
+            return NULL;
+        }
+        if (k == agent_id) {
+            int32_t cidx = srv->agent_map[slot].conn_idx;
+            if (cidx >= 0 && cidx < AB_MAX_CONNS &&
+                srv->conns[cidx].active && srv->conns[cidx].agent_id == agent_id) {
+                return &srv->conns[cidx];
+            }
+            return NULL;
         }
     }
     return NULL;
