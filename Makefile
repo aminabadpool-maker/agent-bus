@@ -5,7 +5,7 @@ SAN_FLAGS ?= -std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined 
 .PHONY: all test test-asan clean
 all: build/agent_busd
 
-build/agent_busd: src/main.c src/ab_frame.c
+build/agent_busd: src/main.c src/ab_frame.c src/ab_net.c
 	@mkdir -p build
 	$(CC) $(CFLAGS) $^ -o $@
 
