@@ -447,11 +447,11 @@ int ab_server_run(ab_server_t *srv) {
         return -1;
     }
 
-    struct epoll_event events[256];
+    struct epoll_event events[1024];
     srv->running = 1;
 
     while (srv->running) {
-        int nfds = epoll_wait(srv->epoll_fd, events, 256, 250);
+        int nfds = epoll_wait(srv->epoll_fd, events, 1024, 250);
         if (!srv->running) {
             break;
         }
