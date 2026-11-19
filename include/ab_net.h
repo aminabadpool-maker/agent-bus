@@ -39,5 +39,6 @@ int ab_server_run(ab_server_t *srv);
 void ab_server_stop(ab_server_t *srv);
 void ab_server_close(ab_server_t *srv);
 int ab_conn_send(ab_server_t *srv, ab_conn_t *conn, const uint8_t *data, size_t len);
+ab_conn_t *ab_server_find_by_agent(ab_server_t *srv, uint64_t agent_id);
 
 #endif

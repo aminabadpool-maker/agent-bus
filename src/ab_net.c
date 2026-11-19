@@ -385,3 +385,15 @@ void ab_server_close(ab_server_t *srv) {
         srv->listen_fd = -1;
     }
 }
+
+ab_conn_t *ab_server_find_by_agent(ab_server_t *srv, uint64_t agent_id) {
+    if (!srv || agent_id == 0ull) {
+        return NULL;
+    }
+    for (int i = 0; i < AB_MAX_CONNS; i++) {
+        if (srv->conns[i].active && srv->conns[i].agent_id == agent_id) {
+            return &srv->conns[i];
+        }
+    }
+    return NULL;
+}
