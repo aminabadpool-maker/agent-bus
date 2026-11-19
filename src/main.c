@@ -80,19 +80,27 @@ static void handle_frame(ab_conn_t *conn, const ab_header_t *hdr,
 }
 
 int main(void) {
-    ab_server_t srv;
-    g_srv = &srv;
+    ab_server_t *srv = calloc(1, sizeof(*srv));
+    if (!srv) {
+        fprintf(stderr, "failed to allocate agent-bus server\n");
+        return 1;
+    }
+    g_srv = srv;
 
     signal(SIGINT, on_sigint);
     signal(SIGTERM, on_sigint);
 
-    if (ab_server_init(&srv, "127.0.0.1", 9090u, handle_frame, &srv) < 0) {
+    if (ab_server_init(srv, "127.0.0.1", 9090u, handle_frame, srv) < 0) {
         fprintf(stderr, "failed to initialize agent-bus server\n");
+        free(srv);
         return 1;
     }
 
     printf("agent-bus listening on 127.0.0.1:9090...\n");
-    int rc = ab_server_run(&srv);
-    ab_server_close(&srv);
+    fflush(stdout);
+    int rc = ab_server_run(srv);
+    ab_server_close(srv);
+    free(srv);
+    g_srv = NULL;
     return (rc < 0) ? 1 : 0;
 }

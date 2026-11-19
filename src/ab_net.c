@@ -348,6 +348,7 @@ int ab_server_init(ab_server_t *srv, const char *host, uint16_t port,
 
     int lfd = socket(AF_INET, SOCK_STREAM, 0);
     if (lfd < 0) {
+        perror("ab_server_init: socket");
         return -1;
     }
 
@@ -364,17 +365,20 @@ int ab_server_init(ab_server_t *srv, const char *host, uint16_t port,
     }
 
     if (bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("ab_server_init: bind");
         close(lfd);
         return -1;
     }
 
     if (set_nonblocking(lfd) < 0 || listen(lfd, 4096) < 0) {
+        perror("ab_server_init: listen/nonblock");
         close(lfd);
         return -1;
     }
 
     int epfd = epoll_create1(0);
     if (epfd < 0) {
+        perror("ab_server_init: epoll_create1");
         close(lfd);
         return -1;
     }
