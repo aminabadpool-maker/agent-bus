@@ -12,6 +12,9 @@
 #include <time.h>
 #include <unistd.h>
 
+#define CONNECT_BATCH_SIZE 128
+#define MAX_CONNECT_ROUNDS 4
+
 static int set_nonblocking(int fd) {
     int fl = fcntl(fd, F_GETFL, 0);
     if (fl < 0) return -1;
@@ -22,51 +25,6 @@ static double now_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
-}
-
-static int wait_connect_complete(int fd, int timeout_ms) {
-    struct pollfd pfd;
-    int remaining_ms = timeout_ms;
-
-    for (;;) {
-        pfd.fd = fd;
-        pfd.events = POLLOUT;
-        pfd.revents = 0;
-
-        double t_start = now_sec();
-        int prc = poll(&pfd, 1, remaining_ms > 0 ? remaining_ms : 0);
-        int elapsed_ms = (int)((now_sec() - t_start) * 1000.0);
-        if (elapsed_ms > 0) {
-            remaining_ms -= elapsed_ms;
-        }
-
-        if (prc > 0) {
-            int err = 0;
-            socklen_t len = sizeof(err);
-            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0) {
-                return -1;
-            }
-            if (err == EINPROGRESS && remaining_ms > 0) {
-                continue;
-            }
-            if (err != 0) {
-                errno = err;
-                return -1;
-            }
-            if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
-                errno = ECONNRESET;
-                return -1;
-            }
-            return 0;
-        }
-        if (prc == 0 || remaining_ms <= 0) {
-            errno = ETIMEDOUT;
-            return -1;
-        }
-        if (errno != EINTR) {
-            return -1;
-        }
-    }
 }
 
 static void drain_socket_recv(int fd) {
@@ -80,14 +38,196 @@ static void drain_socket_recv(int fd) {
             errno = ECONNRESET;
             break;
         }
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
             break;
-        }
-        if (errno == EINTR) {
-            continue;
         }
         break;
     }
+}
+
+static void sleep_ms(long ms) {
+    if (ms <= 0) return;
+    struct timespec ts = {
+        .tv_sec = ms / 1000L,
+        .tv_nsec = (ms % 1000L) * 1000000L
+    };
+    nanosleep(&ts, NULL);
+}
+
+static int initiate_nonblocking_connect(int *fd_out, const struct sockaddr_in *addr) {
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) {
+        return -1;
+    }
+    if (set_nonblocking(s) < 0) {
+        int saved = errno;
+        close(s);
+        errno = saved;
+        return -1;
+    }
+    int rc = connect(s, (const struct sockaddr *)addr, sizeof(*addr));
+    if (rc == 0) {
+        *fd_out = s;
+        return 1;
+    }
+    if (errno == EINPROGRESS) {
+        *fd_out = s;
+        return 0;
+    }
+    int saved = errno;
+    close(s);
+    errno = saved;
+    return -1;
+}
+
+static void connect_slice_batched(const struct sockaddr_in *addr,
+                                  int *fds,
+                                  int start_idx,
+                                  int count,
+                                  int *connected_out,
+                                  int *conn_err_out,
+                                  int *refused_out) {
+    int need_connect[CONNECT_BATCH_SIZE];
+    int pending_idx[CONNECT_BATCH_SIZE];
+    int need_cnt = 0;
+
+    for (int j = 0; j < count; j++) {
+        fds[start_idx + j] = -1;
+        need_connect[need_cnt++] = start_idx + j;
+    }
+
+    int last_err = 0;
+    int last_refused = 0;
+
+    for (int round = 0; round < MAX_CONNECT_ROUNDS && need_cnt > 0; round++) {
+        int pending_cnt = 0;
+        int next_need[CONNECT_BATCH_SIZE];
+        int next_need_cnt = 0;
+
+        for (int k = 0; k < need_cnt; k++) {
+            int idx = need_connect[k];
+            int fd = -1;
+            int st = initiate_nonblocking_connect(&fd, addr);
+            if (st == 1) {
+                fds[idx] = fd;
+                (*connected_out)++;
+            } else if (st == 0) {
+                fds[idx] = fd;
+                pending_idx[pending_cnt++] = idx;
+            } else {
+                last_err = errno;
+                if (errno == ECONNREFUSED) {
+                    last_refused++;
+                }
+                next_need[next_need_cnt++] = idx;
+            }
+        }
+
+        if (pending_cnt > 0) {
+            struct pollfd pfds[CONNECT_BATCH_SIZE];
+            int remaining = pending_cnt;
+            double deadline = now_sec() + 0.25;
+
+            while (remaining > 0 && now_sec() < deadline) {
+                int np = 0;
+                for (int k = 0; k < pending_cnt; k++) {
+                    int idx = pending_idx[k];
+                    if (fds[idx] >= 0) {
+                        pfds[np].fd = fds[idx];
+                        pfds[np].events = POLLOUT;
+                        pfds[np].revents = 0;
+                        np++;
+                    }
+                }
+                if (np == 0) {
+                    break;
+                }
+
+                int rem_ms = (int)((deadline - now_sec()) * 1000.0);
+                if (rem_ms <= 0) {
+                    break;
+                }
+                if (rem_ms > 25) {
+                    rem_ms = 25;
+                }
+
+                int prc = poll(pfds, (nfds_t)np, rem_ms);
+                if (prc < 0) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    break;
+                }
+                if (prc == 0) {
+                    continue;
+                }
+
+                int cursor = 0;
+                for (int k = 0; k < pending_cnt; k++) {
+                    int idx = pending_idx[k];
+                    if (fds[idx] < 0) {
+                        continue;
+                    }
+                    short rev = pfds[cursor++].revents;
+                    if (rev == 0) {
+                        continue;
+                    }
+                    int err = 0;
+                    socklen_t elen = sizeof(err);
+                    if (getsockopt(fds[idx], SOL_SOCKET, SO_ERROR, &err, &elen) < 0) {
+                        err = errno ? errno : EIO;
+                    }
+                    if (err == EINPROGRESS) {
+                        continue;
+                    }
+                    if (err == 0 && !(rev & (POLLERR | POLLHUP | POLLNVAL))) {
+                        (*connected_out)++;
+                        remaining--;
+                    } else {
+                        close(fds[idx]);
+                        fds[idx] = -1;
+                        remaining--;
+                        last_err = err;
+                        if (err == ECONNREFUSED) {
+                            last_refused++;
+                        }
+                        next_need[next_need_cnt++] = idx;
+                    }
+                }
+            }
+
+            for (int k = 0; k < pending_cnt; k++) {
+                int idx = pending_idx[k];
+                if (fds[idx] >= 0) {
+                    close(fds[idx]);
+                    fds[idx] = -1;
+                    last_err = ETIMEDOUT;
+                    next_need[next_need_cnt++] = idx;
+                }
+            }
+        }
+
+        need_cnt = next_need_cnt;
+        for (int k = 0; k < need_cnt; k++) {
+            need_connect[k] = next_need[k];
+        }
+
+        if (need_cnt > 0 && round + 1 < MAX_CONNECT_ROUNDS) {
+            sleep_ms(3L);
+        }
+    }
+
+    for (int k = 0; k < need_cnt; k++) {
+        int idx = need_connect[k];
+        fds[idx] = -1;
+        (*conn_err_out)++;
+        if ((*conn_err_out) <= 5) {
+            fprintf(stderr, "conn_err[%d] at agent %d: %s (errno=%d)\n",
+                    (*conn_err_out) - 1, idx,
+                    last_err ? strerror(last_err) : "connect failed", last_err);
+        }
+    }
+    (*refused_out) += last_refused;
 }
 
 int main(int argc, char **argv) {
@@ -128,72 +268,13 @@ int main(int argc, char **argv) {
     int connect_errors = 0;
     int refused_errors = 0;
 
-    for (int i = 0; i < agents; i++) {
-        if (i > 0 && (i % 256) == 0) {
-            struct timespec pace = { .tv_sec = 0, .tv_nsec = 2000000L };
-            nanosleep(&pace, NULL);
+    for (int base = 0; base < agents; base += CONNECT_BATCH_SIZE) {
+        int slice = agents - base;
+        if (slice > CONNECT_BATCH_SIZE) {
+            slice = CONNECT_BATCH_SIZE;
         }
-
-        const int max_attempts = 32;
-        int ok = 0;
-        for (int attempt = 0; attempt < max_attempts; attempt++) {
-            int s = socket(AF_INET, SOCK_STREAM, 0);
-            if (s < 0) {
-                if (attempt == max_attempts - 1) {
-                    if (connect_errors < 5) {
-                        fprintf(stderr, "conn_err[%d] at agent %d: %s (errno=%d)\n",
-                                connect_errors, i, strerror(errno), errno);
-                    }
-                    connect_errors++;
-                }
-                continue;
-            }
-            if (set_nonblocking(s) < 0) {
-                int saved_err = errno;
-                close(s);
-                if (attempt == max_attempts - 1) {
-                    if (connect_errors < 5) {
-                        fprintf(stderr, "conn_err[%d] at agent %d: %s (errno=%d)\n",
-                                connect_errors, i, strerror(saved_err), saved_err);
-                    }
-                    connect_errors++;
-                }
-                continue;
-            }
-            int rc = connect(s, (struct sockaddr *)&addr, sizeof(addr));
-            if (rc < 0) {
-                if (errno != EINPROGRESS || wait_connect_complete(s, 5000) < 0) {
-                    int saved_err = errno;
-                    close(s);
-                    if (saved_err == ECONNREFUSED && attempt + 1 < max_attempts) {
-                        long delay_ms = 5L * (attempt + 1);
-                        if (delay_ms > 50L) {
-                            delay_ms = 50L;
-                        }
-                        struct timespec ts = {
-                            .tv_sec = delay_ms / 1000L,
-                            .tv_nsec = (delay_ms % 1000L) * 1000000L
-                        };
-                        nanosleep(&ts, NULL);
-                        continue;
-                    }
-                    if (saved_err == ECONNREFUSED) {
-                        refused_errors++;
-                    }
-                    if (connect_errors < 5) {
-                        fprintf(stderr, "conn_err[%d] at agent %d: %s (errno=%d)\n",
-                                connect_errors, i, strerror(saved_err), saved_err);
-                    }
-                    connect_errors++;
-                    break;
-                }
-            }
-            fds[i] = s;
-            connected++;
-            ok = 1;
-            break;
-        }
-        (void)ok;
+        connect_slice_batched(&addr, fds, base, slice,
+                              &connected, &connect_errors, &refused_errors);
     }
 
     int total_sent = 0;
@@ -203,8 +284,6 @@ int main(int argc, char **argv) {
         for (int i = 0; i < agents; i++) {
             int s = fds[i];
             if (s < 0) continue;
-
-            drain_socket_recv(s);
 
             uint8_t pkt[128];
             size_t flen = 0;
@@ -247,6 +326,11 @@ int main(int argc, char **argv) {
             if (fds[i] >= 0 && off == flen) {
                 sent_msgs[i]++;
                 total_sent++;
+            }
+        }
+        for (int i = 0; i < agents; i++) {
+            if (fds[i] >= 0) {
+                drain_socket_recv(fds[i]);
             }
         }
     }
