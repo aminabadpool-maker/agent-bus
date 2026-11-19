@@ -2,6 +2,7 @@
 #define AB_NET_H
 
 #include "ab_frame.h"
+#include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <time.h>
@@ -38,7 +39,7 @@ typedef void (*ab_on_frame_fn)(ab_conn_t *conn, const ab_header_t *hdr,
 typedef struct {
     int listen_fd;
     int epoll_fd;
-    int running;
+    volatile sig_atomic_t running;
     int idle_timeout_sec;
     int ping_interval_sec;
     ab_conn_t conns[AB_MAX_CONNS];

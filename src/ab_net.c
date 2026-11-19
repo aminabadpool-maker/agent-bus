@@ -452,6 +452,9 @@ int ab_server_run(ab_server_t *srv) {
 
     while (srv->running) {
         int nfds = epoll_wait(srv->epoll_fd, events, 256, 250);
+        if (!srv->running) {
+            break;
+        }
         if (nfds < 0) {
             if (errno == EINTR) {
                 ab_server_sweep_timers(srv, time(NULL));
