@@ -196,17 +196,20 @@ static void handle_accept(ab_server_t *srv) {
     }
 }
 
+#define AB_BATCH_FLUSH_BYTES 16384u
+
 static void flush_conn_send(ab_server_t *srv, ab_conn_t *c) {
     if (!c || !c->active || c->fd < 0) {
         return;
     }
 
+    int wrote_any = 0;
     while (c->send_off < c->send_len) {
         ssize_t n = send(c->fd, c->send_buf + c->send_off,
                          c->send_len - c->send_off, MSG_NOSIGNAL);
         if (n > 0) {
             c->send_off += (size_t)n;
-            c->last_active = time(NULL);
+            wrote_any = 1;
         } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             break;
         } else if (n < 0 && errno == EINTR) {
@@ -215,6 +218,10 @@ static void flush_conn_send(ab_server_t *srv, ab_conn_t *c) {
             conn_reset(srv, c);
             return;
         }
+    }
+
+    if (wrote_any) {
+        c->last_active = time(NULL);
     }
 
     if (c->send_off == c->send_len) {
@@ -284,7 +291,9 @@ int ab_conn_send(ab_server_t *srv, ab_conn_t *c, const uint8_t *data, size_t len
 
     memcpy(c->send_buf + c->send_len, data, len);
     c->send_len += len;
-    flush_conn_send(srv, c);
+    if (!c->want_write || c->send_len >= AB_BATCH_FLUSH_BYTES) {
+        flush_conn_send(srv, c);
+    }
     return 0;
 }
 
