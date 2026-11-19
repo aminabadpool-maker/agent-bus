@@ -4,17 +4,20 @@
 #include "ab_frame.h"
 #include <stddef.h>
 #include <stdint.h>
+#include <time.h>
 
 #define AB_MAX_CONNS 16384
 #define AB_HASH_CAP 32768u
 #define AB_RECV_BUF_CAP 65536u
 #define AB_SEND_BUF_CAP 65536u
+#define AB_IDLE_TIMEOUT_SEC 60
 
 typedef struct {
     int fd;
     int active;
     int want_write;
     uint64_t agent_id;
+    time_t last_active;
     uint8_t recv_buf[AB_RECV_BUF_CAP];
     size_t recv_len;
     uint8_t send_buf[AB_SEND_BUF_CAP];
@@ -34,6 +37,7 @@ typedef struct {
     int listen_fd;
     int epoll_fd;
     int running;
+    int idle_timeout_sec;
     ab_conn_t conns[AB_MAX_CONNS];
     ab_hash_slot_t agent_map[AB_HASH_CAP];
     ab_on_frame_fn on_frame;

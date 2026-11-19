@@ -58,7 +58,6 @@ static void map_remove_by_key_and_idx(ab_server_t *srv, uint64_t agent_id, int32
             srv->agent_map[slot].key = 0ull;
             srv->agent_map[slot].conn_idx = -1;
 
-            /* Re-insert contiguous cluster entries so linear probing stays intact */
             uint32_t next = (slot + 1u) & (AB_HASH_CAP - 1u);
             while (srv->agent_map[next].key != 0ull) {
                 uint64_t rk = srv->agent_map[next].key;
@@ -113,9 +112,23 @@ static void conn_reset(ab_server_t *srv, ab_conn_t *c) {
     c->active = 0;
     c->want_write = 0;
     c->agent_id = 0;
+    c->last_active = 0;
     c->recv_len = 0;
     c->send_len = 0;
     c->send_off = 0;
+}
+
+static void sweep_idle_conns(ab_server_t *srv, time_t now) {
+    if (!srv || srv->idle_timeout_sec <= 0) {
+        return;
+    }
+    time_t limit = (time_t)srv->idle_timeout_sec;
+    for (int i = 0; i < AB_MAX_CONNS; i++) {
+        ab_conn_t *c = &srv->conns[i];
+        if (c->active && c->last_active > 0 && (now - c->last_active) > limit) {
+            conn_reset(srv, c);
+        }
+    }
 }
 
 static int epoll_add_read(int epoll_fd, int fd) {
@@ -127,6 +140,7 @@ static int epoll_add_read(int epoll_fd, int fd) {
 }
 
 static void handle_accept(ab_server_t *srv) {
+    time_t now = time(NULL);
     for (;;) {
         struct sockaddr_in addr;
         socklen_t addr_len = sizeof(addr);
@@ -155,6 +169,7 @@ static void handle_accept(ab_server_t *srv) {
         memset(c, 0, sizeof(*c));
         c->fd = cfd;
         c->active = 1;
+        c->last_active = now;
     }
 }
 
@@ -168,6 +183,7 @@ static void flush_conn_send(ab_server_t *srv, ab_conn_t *c) {
                          c->send_len - c->send_off, MSG_NOSIGNAL);
         if (n > 0) {
             c->send_off += (size_t)n;
+            c->last_active = time(NULL);
         } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             break;
         } else if (n < 0 && errno == EINTR) {
@@ -212,6 +228,9 @@ int ab_conn_send(ab_server_t *srv, ab_conn_t *c, const uint8_t *data, size_t len
                 conn_reset(srv, c);
                 return -1;
             }
+        }
+        if (sent > 0u) {
+            c->last_active = time(NULL);
         }
         if (sent == len) {
             return 0;
@@ -264,6 +283,8 @@ static void process_conn_buffer(ab_server_t *srv, ab_conn_t *c) {
             return;
         }
 
+        c->last_active = time(NULL);
+
         if (hdr.type == AB_MSG_HELLO && hdr.agent_id != 0ull) {
             int32_t idx = (int32_t)(c - srv->conns);
             if (c->agent_id != 0ull && c->agent_id != hdr.agent_id) {
@@ -307,6 +328,7 @@ static void handle_client_read(ab_server_t *srv, int fd) {
         ssize_t n = recv(c->fd, c->recv_buf + c->recv_len,
                          AB_RECV_BUF_CAP - c->recv_len, 0);
         if (n > 0) {
+            c->last_active = time(NULL);
             c->recv_len += (size_t)n;
             process_conn_buffer(srv, c);
             if (!c->active) {
@@ -337,6 +359,7 @@ int ab_server_init(ab_server_t *srv, const char *host, uint16_t port,
     memset(srv, 0, sizeof(*srv));
     srv->listen_fd = -1;
     srv->epoll_fd = -1;
+    srv->idle_timeout_sec = AB_IDLE_TIMEOUT_SEC;
     srv->on_frame = on_frame;
     srv->user_ctx = user_ctx;
 
@@ -407,6 +430,7 @@ int ab_server_run(ab_server_t *srv) {
         int nfds = epoll_wait(srv->epoll_fd, events, 256, 250);
         if (nfds < 0) {
             if (errno == EINTR) {
+                sweep_idle_conns(srv, time(NULL));
                 continue;
             }
             return -1;
@@ -431,6 +455,8 @@ int ab_server_run(ab_server_t *srv) {
                 }
             }
         }
+
+        sweep_idle_conns(srv, time(NULL));
     }
 
     return 0;
