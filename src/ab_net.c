@@ -22,17 +22,34 @@ static int set_nonblocking(int fd) {
     return 0;
 }
 
-static void conn_reset(ab_conn_t *c) {
+static int epoll_update_events(int epoll_fd, ab_conn_t *c) {
+    if (!c || c->fd < 0) {
+        return -1;
+    }
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.events = EPOLLIN | EPOLLRDHUP | (c->want_write ? EPOLLOUT : 0u);
+    ev.data.fd = c->fd;
+    return epoll_ctl(epoll_fd, EPOLL_CTL_MOD, c->fd, &ev);
+}
+
+static void conn_reset(ab_server_t *srv, ab_conn_t *c) {
     if (!c) {
         return;
     }
     if (c->fd >= 0) {
+        if (srv && srv->epoll_fd >= 0) {
+            epoll_ctl(srv->epoll_fd, EPOLL_CTL_DEL, c->fd, NULL);
+        }
         close(c->fd);
     }
     c->fd = -1;
     c->active = 0;
+    c->want_write = 0;
     c->agent_id = 0;
     c->recv_len = 0;
+    c->send_len = 0;
+    c->send_off = 0;
 }
 
 static int epoll_add_read(int epoll_fd, int fd) {
@@ -69,11 +86,98 @@ static void handle_accept(ab_server_t *srv) {
         }
 
         ab_conn_t *c = &srv->conns[cfd];
+        memset(c, 0, sizeof(*c));
         c->fd = cfd;
         c->active = 1;
-        c->agent_id = 0;
-        c->recv_len = 0;
     }
+}
+
+static void flush_conn_send(ab_server_t *srv, ab_conn_t *c) {
+    if (!c || !c->active || c->fd < 0) {
+        return;
+    }
+
+    while (c->send_off < c->send_len) {
+        ssize_t n = send(c->fd, c->send_buf + c->send_off,
+                         c->send_len - c->send_off, MSG_NOSIGNAL);
+        if (n > 0) {
+            c->send_off += (size_t)n;
+        } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            break;
+        } else if (n < 0 && errno == EINTR) {
+            continue;
+        } else {
+            conn_reset(srv, c);
+            return;
+        }
+    }
+
+    if (c->send_off == c->send_len) {
+        c->send_off = 0;
+        c->send_len = 0;
+        if (c->want_write) {
+            c->want_write = 0;
+            epoll_update_events(srv->epoll_fd, c);
+        }
+    } else {
+        if (!c->want_write) {
+            c->want_write = 1;
+            epoll_update_events(srv->epoll_fd, c);
+        }
+    }
+}
+
+int ab_conn_send(ab_server_t *srv, ab_conn_t *c, const uint8_t *data, size_t len) {
+    if (!srv || !c || !c->active || c->fd < 0 || !data || len == 0u) {
+        return -1;
+    }
+
+    if (c->send_len == c->send_off && c->send_len == 0u) {
+        size_t sent = 0;
+        while (sent < len) {
+            ssize_t n = send(c->fd, data + sent, len - sent, MSG_NOSIGNAL);
+            if (n > 0) {
+                sent += (size_t)n;
+            } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                break;
+            } else if (n < 0 && errno == EINTR) {
+                continue;
+            } else {
+                conn_reset(srv, c);
+                return -1;
+            }
+        }
+        if (sent == len) {
+            return 0;
+        }
+        size_t rem = len - sent;
+        if (rem > AB_SEND_BUF_CAP) {
+            conn_reset(srv, c);
+            return -1;
+        }
+        memcpy(c->send_buf, data + sent, rem);
+        c->send_len = rem;
+        c->send_off = 0;
+        c->want_write = 1;
+        epoll_update_events(srv->epoll_fd, c);
+        return 0;
+    }
+
+    if (c->send_off > 0u) {
+        memmove(c->send_buf, c->send_buf + c->send_off, c->send_len - c->send_off);
+        c->send_len -= c->send_off;
+        c->send_off = 0;
+    }
+
+    if (c->send_len + len > AB_SEND_BUF_CAP) {
+        conn_reset(srv, c);
+        return -1;
+    }
+
+    memcpy(c->send_buf + c->send_len, data, len);
+    c->send_len += len;
+    flush_conn_send(srv, c);
+    return 0;
 }
 
 static void process_conn_buffer(ab_server_t *srv, ab_conn_t *c) {
@@ -90,7 +194,7 @@ static void process_conn_buffer(ab_server_t *srv, ab_conn_t *c) {
             break;
         }
         if (rc != AB_PARSE_OK) {
-            conn_reset(c);
+            conn_reset(srv, c);
             return;
         }
 
@@ -125,7 +229,7 @@ static void handle_client_read(ab_server_t *srv, int fd) {
 
     for (;;) {
         if (c->recv_len == AB_RECV_BUF_CAP) {
-            conn_reset(c);
+            conn_reset(srv, c);
             return;
         }
 
@@ -138,7 +242,7 @@ static void handle_client_read(ab_server_t *srv, int fd) {
                 return;
             }
         } else if (n == 0) {
-            conn_reset(c);
+            conn_reset(srv, c);
             return;
         } else {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -147,7 +251,7 @@ static void handle_client_read(ab_server_t *srv, int fd) {
             if (errno == EINTR) {
                 continue;
             }
-            conn_reset(c);
+            conn_reset(srv, c);
             return;
         }
     }
@@ -240,10 +344,15 @@ int ab_server_run(ab_server_t *srv) {
                 handle_accept(srv);
             } else if (ev & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
                 if (fd >= 0 && fd < AB_MAX_CONNS) {
-                    conn_reset(&srv->conns[fd]);
+                    conn_reset(srv, &srv->conns[fd]);
                 }
-            } else if (ev & EPOLLIN) {
-                handle_client_read(srv, fd);
+            } else {
+                if (ev & EPOLLIN) {
+                    handle_client_read(srv, fd);
+                }
+                if (fd >= 0 && fd < AB_MAX_CONNS && srv->conns[fd].active && (ev & EPOLLOUT)) {
+                    flush_conn_send(srv, &srv->conns[fd]);
+                }
             }
         }
     }
@@ -264,7 +373,7 @@ void ab_server_close(ab_server_t *srv) {
     srv->running = 0;
     for (int i = 0; i < AB_MAX_CONNS; i++) {
         if (srv->conns[i].active) {
-            conn_reset(&srv->conns[i]);
+            conn_reset(srv, &srv->conns[i]);
         }
     }
     if (srv->epoll_fd >= 0) {

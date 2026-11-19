@@ -7,13 +7,18 @@
 
 #define AB_MAX_CONNS 16384
 #define AB_RECV_BUF_CAP 65536u
+#define AB_SEND_BUF_CAP 65536u
 
 typedef struct {
     int fd;
     int active;
+    int want_write;
     uint64_t agent_id;
     uint8_t recv_buf[AB_RECV_BUF_CAP];
     size_t recv_len;
+    uint8_t send_buf[AB_SEND_BUF_CAP];
+    size_t send_len;
+    size_t send_off;
 } ab_conn_t;
 
 typedef void (*ab_on_frame_fn)(ab_conn_t *conn, const ab_header_t *hdr,
@@ -33,5 +38,6 @@ int ab_server_init(ab_server_t *srv, const char *host, uint16_t port,
 int ab_server_run(ab_server_t *srv);
 void ab_server_stop(ab_server_t *srv);
 void ab_server_close(ab_server_t *srv);
+int ab_conn_send(ab_server_t *srv, ab_conn_t *conn, const uint8_t *data, size_t len);
 
 #endif
